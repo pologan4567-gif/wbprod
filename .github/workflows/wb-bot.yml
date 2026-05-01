@@ -20,13 +20,4 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           ALLOWED_USER_ID: ${{ secrets.ALLOWED_USER_ID }}
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-        run: |
-          python -c "
-          import socket
-          for h in ['advert-api.wb.ru', 'advert-api.wildberries.ru', 'suppliers-api.wildberries.ru']:
-              try:
-                  ip = socket.gethostbyname(h)
-                  print(f'OK: {h} -> {ip}')
-              except Exception as e:
-                  print(f'FAIL: {h} -> {e}')
-          "
+        run: python bot.py
