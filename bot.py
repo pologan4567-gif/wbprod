@@ -36,7 +36,7 @@ pending = {}
 
 MENU_CAMPAIGNS = "📋 Кампании"
 MENU_REPORT = "📊 Отчёт"
-MENU_REFRESH = "🔄 Обновить"
+MENU_BALANCE = "💳 Баланс"
 MENU_SETTINGS = "⚙️ Настройки"
 
 
@@ -93,6 +93,7 @@ async def wb_get_campaigns() -> list[dict]:
 
 
 async def wb_action(cid: int, action: str) -> tuple[bool, str]:
+    """action: start | pause | stop"""
     async with httpx.AsyncClient(timeout=15) as c:
         try:
             r = await c.get(f"{WB_BASE}/adv/v0/{action}", headers=_h(), params={"id": cid})
@@ -103,17 +104,25 @@ async def wb_action(cid: int, action: str) -> tuple[bool, str]:
 
 
 async def wb_get_stats(cid: int) -> dict | None:
+    """Stats via v3 fullstats (POST)"""
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     async with httpx.AsyncClient(timeout=20) as c:
         try:
-            r = await c.get(
-                f"{WB_BASE}/adv/v2/fullstats",
+            r = await c.post(
+                f"{WB_BASE}/adv/v3/fullstats",
                 headers=_h(),
-                params={"id": cid, "interval": f"{today};{today}"}
+                json=[{"id": cid, "dates": [today]}]
             )
-            log.info("stats id=%s status=%s body=%s", cid, r.status_code, r.text[:300])
+            log.info("stats v3 id=%s status=%s body=%s", cid, r.status_code, r.text[:300])
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                # v3 returns list of campaign stat objects
+                if isinstance(data, list) and data:
+                    days = data[0].get("days", [])
+                    if days:
+                        return days[0]
+                    # fallback: top-level aggregate
+                    return data[0]
         except Exception as e:
             log.error("wb_get_stats: %s", e)
     return None
@@ -149,6 +158,33 @@ async def wb_set_bid(cid: int, bid: int, camp_type: int) -> tuple[bool, str]:
             return False, str(e)
 
 
+async def wb_get_balance() -> dict | None:
+    """GET /adv/v1/balance — общий баланс рекламного кабинета"""
+    async with httpx.AsyncClient(timeout=15) as c:
+        try:
+            r = await c.get(f"{WB_BASE}/adv/v1/balance", headers=_h())
+            log.info("balance status=%s body=%s", r.status_code, r.text[:300])
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log.error("wb_get_balance: %s", e)
+    return None
+
+
+async def wb_get_budget(cid: int) -> int | None:
+    """GET /adv/v1/budget — бюджет конкретной кампании"""
+    async with httpx.AsyncClient(timeout=15) as c:
+        try:
+            r = await c.get(f"{WB_BASE}/adv/v1/budget", headers=_h(), params={"id": cid})
+            log.info("budget id=%s status=%s body=%s", cid, r.status_code, r.text[:200])
+            if r.status_code == 200:
+                d = r.json()
+                return d.get("total") or d.get("budget") or d.get("remaining")
+        except Exception as e:
+            log.error("wb_get_budget: %s", e)
+    return None
+
+
 def get_name(c: dict, cid: int) -> str:
     for key in ("name", "campaignName", "advertName", "title"):
         val = c.get(key)
@@ -175,7 +211,7 @@ def app_menu():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(MENU_CAMPAIGNS), KeyboardButton(MENU_REPORT)],
-            [KeyboardButton(MENU_REFRESH), KeyboardButton(MENU_SETTINGS)],
+            [KeyboardButton(MENU_BALANCE), KeyboardButton(MENU_SETTINGS)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел"
@@ -186,6 +222,7 @@ def main_inline_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Открыть кампании", callback_data="list")],
         [InlineKeyboardButton("📊 Дневной отчёт", callback_data="daily_report")],
+        [InlineKeyboardButton("💳 Баланс кабинета", callback_data="balance")],
     ])
 
 
@@ -195,9 +232,12 @@ def camp_kb(cid: int, st: int):
     if st in (4, 11):
         rows.append([InlineKeyboardButton("▶️ Запустить", callback_data=f"confirm:start:{cid}")])
     if st == 9:
-        rows.append([InlineKeyboardButton("⏸ Поставить на паузу", callback_data=f"confirm:pause:{cid}")])
+        rows.append([InlineKeyboardButton("⏸ На паузу", callback_data=f"confirm:pause:{cid}")])
+    if st in (9, 11, 4):
+        rows.append([InlineKeyboardButton("⛔ Остановить", callback_data=f"confirm:stop:{cid}")])
     rows.append([InlineKeyboardButton("📊 Статистика за сегодня", callback_data=f"stats:{cid}")])
     rows.append([InlineKeyboardButton("💰 Изменить ставку", callback_data=f"bid_ask:{cid}")])
+    rows.append([InlineKeyboardButton("🏦 Бюджет кампании", callback_data=f"budget:{cid}")])
     sched_icon = "✅" if sched["enabled"] else "⏸"
     rows.append([InlineKeyboardButton(
         f"{sched_icon} Расписание {sched['on']:02d}:00–{sched['off']:02d}:00",
@@ -208,25 +248,31 @@ def camp_kb(cid: int, st: int):
 
 
 def confirm_kb(cid: int, action: str):
-    label = "Да, запустить" if action == "start" else "Да, поставить на паузу"
-    icon = "✅" if action == "start" else "⏸"
+    labels = {
+        "start": ("✅ Да, запустить", "confirm:start"),
+        "pause": ("⏸ Да, поставить на паузу", "confirm:pause"),
+        "stop":  ("⛔ Да, остановить навсегда", "confirm:stop"),
+    }
+    label, _ = labels.get(action, ("✅ Подтвердить", ""))
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{icon} {label}", callback_data=f"do:{action}:{cid}")],
-        [InlineKeyboardButton("↩️ Отмена", callback_data=f"camp:{cid}:0")],
+        [InlineKeyboardButton(label, callback_data=f"do:{action}:{cid}")],
+        [InlineKeyboardButton("↩️ Отмена", callback_data=f"camp_reload:{cid}")],
     ])
 
 
-def build_card_text(cid: int, camp: dict, bid: int | None) -> str:
+def build_card_text(cid: int, camp: dict, bid: int | None, budget: int | None = None) -> str:
     st = camp.get("status", -1)
     sched = schedules[cid]
     sched_state = "включено" if sched["enabled"] else "выключено"
     name = get_name(camp, cid)
+    budget_line = f"🏦 Бюджет: <b>{fmt_money(budget)}</b>\n" if budget is not None else ""
     return (
         f"📦 <b>{name}</b>\n\n"
         f"🆔 ID: <code>{cid}</code>\n"
         f"📌 Статус: <b>{status_badge(st)}</b>\n"
         f"🏷 Тип: <b>{TYPE_MAP.get(camp.get('type'), '—')}</b>\n"
-        f"💰 Ставка: <b>{fmt_money(bid)}</b>\n\n"
+        f"💰 Ставка: <b>{fmt_money(bid)}</b>\n"
+        f"{budget_line}\n"
         f"⏰ Расписание: <b>{sched_state}</b>\n"
         f"🟢 Включать: <b>{sched['on']:02d}:00 МСК</b>\n"
         f"🔴 Выключать: <b>{sched['off']:02d}:00 МСК</b>"
@@ -234,13 +280,33 @@ def build_card_text(cid: int, camp: dict, bid: int | None) -> str:
 
 
 async def show_camp(send, cid: int, camp: dict):
-    bid = await wb_get_bid(cid)
-    await send(build_card_text(cid, camp, bid), parse_mode="HTML", reply_markup=camp_kb(cid, camp.get("status", -1)))
+    bid, budget = await asyncio.gather(wb_get_bid(cid), wb_get_budget(cid))
+    await send(
+        build_card_text(cid, camp, bid, budget),
+        parse_mode="HTML",
+        reply_markup=camp_kb(cid, camp.get("status", -1))
+    )
+
+
+# ─── cached campaign list for reload without status in callback_data ───────────
+_camps_cache: list[dict] = []
+
+
+async def get_camp_by_id(cid: int) -> dict | None:
+    global _camps_cache
+    # try cache first
+    camp = next((c for c in _camps_cache if c.get("advertId") == cid), None)
+    if camp:
+        return camp
+    # reload
+    _camps_cache = await wb_get_campaigns()
+    return next((c for c in _camps_cache if c.get("advertId") == cid), None)
 
 
 async def render_list(send):
-    campaigns = await wb_get_campaigns()
-    if not campaigns:
+    global _camps_cache
+    _camps_cache = await wb_get_campaigns()
+    if not _camps_cache:
         await send(
             "😕 Не удалось получить кампании.\nПроверь токен WB или повтори позже.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Повторить", callback_data="list")]])
@@ -248,17 +314,18 @@ async def render_list(send):
         return
     buttons = []
     visible = 0
-    for c in campaigns:
+    for c in _camps_cache:
         st = c.get("status", -1)
         if st in HIDDEN_STATUSES:
             continue
         cid = c.get("advertId", 0)
         name = get_name(c, cid)
         short_name = name[:24] + "…" if len(name) > 24 else name
+        # callback_data без статуса — статус берётся из кеша при открытии
         buttons.append([
             InlineKeyboardButton(
                 f"{status_badge(st)} • {short_name}",
-                callback_data=f"camp:{cid}:{st}"
+                callback_data=f"camp_reload:{cid}"
             )
         ])
         visible += 1
@@ -273,8 +340,9 @@ async def render_list(send):
 
 
 async def render_daily_report(send):
-    camps = await wb_get_campaigns()
-    active = [c for c in camps if c.get("status") in (9, 11, 4)]
+    global _camps_cache
+    _camps_cache = await wb_get_campaigns()
+    active = [c for c in _camps_cache if c.get("status") in (9, 11, 4)]
     today = datetime.now(TZ).strftime("%d.%m.%Y")
     if not active:
         await send(f"📊 <b>Дневной отчёт за {today}</b>\n\nНет кампаний для отчёта.", parse_mode="HTML")
@@ -286,9 +354,9 @@ async def render_daily_report(send):
         stats = await wb_get_stats(cid)
         name = get_name(camp, cid)
         if stats:
-            spend = stats.get("sum", 0)
-            clicks = stats.get("clicks", 0)
-            views = stats.get("views", 0)
+            spend = stats.get("sum", 0) or 0
+            clicks = stats.get("clicks", 0) or 0
+            views = stats.get("views", 0) or 0
             ctr = round(clicks / views * 100, 2) if views else 0
             total_spend += spend
             lines.append(f"\n▪️ <b>{name}</b>\n👁 {views:,} | 🖱 {clicks:,} | CTR {ctr}% | 💰 {spend} ₽")
@@ -298,26 +366,54 @@ async def render_daily_report(send):
     await send("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 К кампаниям", callback_data="list")]]))
 
 
+async def render_balance(send):
+    bal = await wb_get_balance()
+    if not bal:
+        await send(
+            "❌ Не удалось получить баланс.\nПроверь токен WB.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Повторить", callback_data="balance")]])
+        )
+        return
+    # WB API fields: balance, bonus, net (зависит от версии)
+    balance  = bal.get("balance")  or bal.get("total")
+    bonus    = bal.get("bonus")
+    net      = bal.get("net")
+
+    lines = ["💳 <b>Баланс рекламного кабинета</b>\n"]
+    if balance  is not None: lines.append(f"💰 Основной баланс: <b>{balance} ₽</b>")
+    if bonus    is not None: lines.append(f"🎁 Бонусы: <b>{bonus} ₽</b>")
+    if net      is not None: lines.append(f"📊 Чистый остаток: <b>{net} ₽</b>")
+    if len(lines) == 1:
+        lines.append(f"<pre>{json.dumps(bal, ensure_ascii=False, indent=2)}</pre>")
+
+    await send(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить баланс", callback_data="balance")],
+            [InlineKeyboardButton("📋 К кампаниям", callback_data="list")],
+        ])
+    )
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
     await update.message.reply_text(
         "👋 <b>WB Ad Manager</b>\n\n"
         "Удобное управление рекламой Wildberries прямо в Telegram.\n"
-        "Выбери раздел в меню ниже или нажми кнопку.",
+        "Выбери раздел в меню ниже.",
         parse_mode="HTML",
         reply_markup=app_menu()
     )
-    await update.message.reply_text(
-        "Главный экран готов.",
-        reply_markup=main_inline_kb()
-    )
+    await update.message.reply_text("Главный экран:", reply_markup=main_inline_kb())
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
-    msg = await update.message.reply_text("⏳ Загружаю список кампаний...", reply_markup=app_menu())
+    # Отправляем промежуточное сообщение БЕЗ app_menu (чтобы потом edit_text работал)
+    msg = await update.message.reply_text("⏳ Загружаю список кампаний...")
     await render_list(msg.edit_text)
 
 
@@ -338,16 +434,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏳ Собираю данные для отчёта...")
         await render_daily_report(q.edit_message_text)
 
-    elif d.startswith("camp:"):
-        _, cid_s, _ = d.split(":")
-        cid = int(cid_s)
+    elif d == "balance":
+        await q.answer()
+        await q.edit_message_text("⏳ Загружаю баланс...")
+        await render_balance(q.edit_message_text)
+
+    elif d.startswith("camp_reload:"):
+        # Используется вместо старого camp:{cid}:{status}
+        cid = int(d.split(":")[1])
         await q.answer()
         await q.edit_message_text("⏳ Открываю карточку кампании...")
-        camps = await wb_get_campaigns()
-        camp = next((c for c in camps if c.get("advertId") == cid), None)
+        camp = await get_camp_by_id(cid)
         if not camp:
             await q.edit_message_text(
-                "❌ Кампания не найдена.\nВозможно, она уже завершена или недоступна.",
+                "❌ Кампания не найдена или уже завершена.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад к списку", callback_data="list")]])
             )
             return
@@ -356,10 +456,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("confirm:"):
         _, action, cid_s = d.split(":")
         cid = int(cid_s)
-        camps = await wb_get_campaigns()
-        camp = next((c for c in camps if c.get("advertId") == cid), None)
+        camp = await get_camp_by_id(cid)
         name = get_name(camp, cid) if camp else f"ID {cid}"
-        action_text = "запустить" if action == "start" else "поставить на паузу"
+        action_texts = {"start": "запустить", "pause": "поставить на паузу", "stop": "полностью остановить"}
+        action_text = action_texts.get(action, action)
         await q.answer()
         await q.edit_message_text(
             f"⚠️ <b>Подтверждение действия</b>\n\n"
@@ -376,14 +476,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("⏳ Выполняю...")
         ok, msg = await wb_action(cid, action)
         now = datetime.now(TZ).strftime("%H:%M")
-        success_text = "🟢 Кампания запущена" if action == "start" else "⏸ Кампания поставлена на паузу"
-        fail_text = "запуска" if action == "start" else "постановки на паузу"
+        icons = {"start": "🟢 Кампания запущена", "pause": "⏸ Кампания поставлена на паузу", "stop": "⛔ Кампания остановлена"}
+        result_text = icons.get(action, "✅ Готово") if ok else f"⚠️ Ошибка действия {action}: {msg}"
         await q.edit_message_text(
-            f"{success_text if ok else '⚠️ Ошибка ' + fail_text + ': ' + msg}\n\n"
-            f"Время: <b>{now} МСК</b>",
+            f"{result_text}\n\nВремя: <b>{now} МСК</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ Вернуться к кампании", callback_data=f"camp:{cid}:0")],
+                [InlineKeyboardButton("↩️ Вернуться к кампании", callback_data=f"camp_reload:{cid}")],
                 [InlineKeyboardButton("📋 К списку кампаний", callback_data="list")],
             ])
         )
@@ -391,12 +490,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("stats:"):
         cid = int(d.split(":")[1])
         await q.answer("⏳ Загружаю статистику...")
+        await q.edit_message_text("⏳ Загружаю статистику...")
         stats = await wb_get_stats(cid)
         today = datetime.now(TZ).strftime("%d.%m.%Y")
         if stats:
-            views = stats.get("views", 0)
-            clicks = stats.get("clicks", 0)
-            spend = stats.get("sum", 0)
+            views  = stats.get("views", 0) or 0
+            clicks = stats.get("clicks", 0) or 0
+            spend  = stats.get("sum", 0) or 0
             ctr = round(clicks / views * 100, 2) if views else 0
             cpc = round(spend / clicks, 2) if clicks else 0
             text = (
@@ -412,7 +512,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             text,
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp:{cid}:0")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")]])
+        )
+
+    elif d.startswith("budget:"):
+        cid = int(d.split(":")[1])
+        await q.answer("⏳ Загружаю бюджет...")
+        await q.edit_message_text("⏳ Загружаю бюджет кампании...")
+        budget = await wb_get_budget(cid)
+        if budget is not None:
+            text = f"🏦 <b>Бюджет кампании</b>\n\nID: <code>{cid}</code>\nОстаток: <b>{budget} ₽</b>"
+        else:
+            text = f"🏦 <b>Бюджет кампании</b>\n\nID: <code>{cid}</code>\n😕 Не удалось получить данные."
+        await q.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data=f"budget:{cid}")],
+                [InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")],
+            ])
         )
 
     elif d.startswith("bid_ask:"):
@@ -439,7 +557,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(toggle, callback_data=f"sched_toggle:{cid}")],
-                [InlineKeyboardButton("« К кампании", callback_data=f"camp:{cid}:0")],
+                [InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")],
             ])
         )
 
@@ -455,7 +573,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🟢 Включать: <b>{sched['on']:02d}:00 МСК</b>\n"
             f"🔴 Выключать: <b>{sched['off']:02d}:00 МСК</b>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp:{cid}:0")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")]])
         )
 
 
@@ -467,16 +585,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if text == MENU_CAMPAIGNS:
-        msg = await update.message.reply_text("⏳ Загружаю список кампаний...", reply_markup=app_menu())
+        msg = await update.message.reply_text("⏳ Загружаю список кампаний...")
         await render_list(msg.edit_text)
         return
     if text == MENU_REPORT:
-        msg = await update.message.reply_text("⏳ Собираю дневной отчёт...", reply_markup=app_menu())
+        msg = await update.message.reply_text("⏳ Собираю дневной отчёт...")
         await render_daily_report(msg.edit_text)
         return
-    if text == MENU_REFRESH:
-        msg = await update.message.reply_text("🔄 Обновляю данные...", reply_markup=app_menu())
-        await render_list(msg.edit_text)
+    if text == MENU_BALANCE:
+        msg = await update.message.reply_text("⏳ Загружаю баланс...")
+        await render_balance(msg.edit_text)
         return
     if text == MENU_SETTINGS:
         await update.message.reply_text(
@@ -507,14 +625,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Ставка должна быть целым числом от 50 до 5000 ₽", reply_markup=app_menu())
             pending[uid] = p
             return
-        camps = await wb_get_campaigns()
-        camp = next((c for c in camps if c.get("advertId") == cid), None)
+        camp = await get_camp_by_id(cid)
         camp_type = camp.get("type", 8) if camp else 8
         ok, msg = await wb_set_bid(cid, bid, camp_type)
         await update.message.reply_text(
             f"{'✅ Ставка обновлена: ' + str(bid) + ' ₽' if ok else '⚠️ Ошибка изменения ставки: ' + msg}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp:{cid}:0")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")]])
         )
         return
 
@@ -533,7 +650,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Расписание сохранено\n\n🟢 Включать: <b>{on_h:02d}:00 МСК</b>\n🔴 Выключать: <b>{off_h:02d}:00 МСК</b>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp:{cid}:0")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« К кампании", callback_data=f"camp_reload:{cid}")]])
         )
 
 
@@ -568,8 +685,9 @@ async def auto_scheduler(app: Application):
 
         if h == 23 and now.day != last_report_day:
             last_report_day = now.day
-            camps = await wb_get_campaigns()
-            active = [c for c in camps if c.get("status") in (9, 11)]
+            global _camps_cache
+            _camps_cache = await wb_get_campaigns()
+            active = [c for c in _camps_cache if c.get("status") in (9, 11)]
             if active:
                 lines = [f"📊 <b>Дневной отчёт {now.strftime('%d.%m.%Y')}</b>"]
                 total_spend = 0
@@ -578,9 +696,9 @@ async def auto_scheduler(app: Application):
                     stats = await wb_get_stats(cid)
                     name = get_name(camp, cid)
                     if stats:
-                        spend = stats.get("sum", 0)
-                        clicks = stats.get("clicks", 0)
-                        views = stats.get("views", 0)
+                        spend = stats.get("sum", 0) or 0
+                        clicks = stats.get("clicks", 0) or 0
+                        views = stats.get("views", 0) or 0
                         ctr = round(clicks / views * 100, 2) if views else 0
                         total_spend += spend
                         lines.append(f"\n▪️ <b>{name}</b>\n👁 {views:,} | 🖱 {clicks:,} | CTR {ctr}% | 💰 {spend} ₽")
