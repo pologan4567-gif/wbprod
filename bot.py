@@ -19,7 +19,7 @@ OWNER_ID  = int(os.environ["ALLOWED_USER_ID"])
 WB_TOKEN  = os.environ["WB_API_TOKEN"]
 TZ        = ZoneInfo("Europe/Moscow")
 
-WB_BASE = "https://advert-api.wb.ru"
+WB_BASE = "https://advert-api.wildberries.ru"
 
 STATUS = {
     -1: "🗑 Удалена", 4: "⏸ Готова", 7: "✅ Завершена",
