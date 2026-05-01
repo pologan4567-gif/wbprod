@@ -1,0 +1,36 @@
+name: WB Telegram Bot (polling)
+
+on:
+  # Перезапускается каждые 5 часов 50 минут (< 6ч лимита GitHub Actions)
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+# Только один экземпляр бота одновременно
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    name: 🤖 Telegram Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # ~5ч 50м, чуть меньше лимита GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
+          ALLOWED_USER_ID: ${{ secrets.ALLOWED_USER_ID }}
+          WB_API_TOKEN:    ${{ secrets.WB_API_TOKEN }}
+        run: python bot.py
