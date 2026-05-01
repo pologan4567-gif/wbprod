@@ -1,0 +1,55 @@
+name: WB Ad Scheduler (cron)
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Действие'
+        required: true
+        default: 'start'
+        type: choice
+        options: [start, stop]
+
+jobs:
+  ad-start:
+    name: Запустить рекламу
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'start')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install httpx
+      - name: Start campaigns
+        env:
+          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+          CAMPAIGN_IDS: ${{ secrets.CAMPAIGN_IDS }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          ALLOWED_USER_ID: ${{ secrets.ALLOWED_USER_ID }}
+        run: python cron_action.py start
+
+  ad-stop:
+    name: Остановить рекламу
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 20 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'stop')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install httpx
+      - name: Stop campaigns
+        env:
+          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+          CAMPAIGN_IDS: ${{ secrets.CAMPAIGN_IDS }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          ALLOWED_USER_ID: ${{ secrets.ALLOWED_USER_ID }}
+        run: python cron_action.py stop
