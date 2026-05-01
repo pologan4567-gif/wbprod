@@ -135,7 +135,7 @@ async def render_list(send):
     buttons = []
     for c in campaigns:
         cid = c.get("advertId", 0)
-        name = c.get("name", f"Кампания {cid}")[:35]
+        name = (c.get("name") or c.get("campaignName") or f"ID {cid}")[:35]
         st = c.get("status", -1)
         buttons.append([InlineKeyboardButton(f"{STATUS.get(st,'?')}  {name}", callback_data=f"camp:{cid}:{st}")])
     buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="list")])
